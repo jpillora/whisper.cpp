@@ -32,6 +32,11 @@ cmake --build "$BUILD_DIR" --target whisper-server -j"$JOBS" --config Release
 mkdir -p dist
 cp "$BUILD_DIR/bin/whisper-server" dist/whisper-server
 
+# On Apple Silicon, a plain copy invalidates the linker's ad-hoc code signature,
+# and the kernel then SIGKILLs the copy ("Code Signature Invalid"). Re-sign it.
+echo "==> Re-signing dist/whisper-server (ad-hoc)"
+codesign --force --sign - dist/whisper-server
+
 echo
 echo "==> Built dist/whisper-server"
 ls -lh dist/whisper-server | awk '{print "    size: " $5}'
@@ -39,4 +44,11 @@ echo
 echo "==> Linkage (note: no libwhisper / libggml dylibs — they are baked in):"
 otool -L dist/whisper-server | sed '1d;s/^/    /'
 echo
-echo "Done. Run it with: ./run-server.sh"
+echo "Done. The server downloads its model on first run and caches it under"
+echo '  ${XDG_STATE_HOME:-$HOME/.local/state}/whisper-server/models'
+echo "Run it with:"
+echo "  dist/whisper-server --convert                 # default model: small.en"
+echo "  dist/whisper-server --convert --model base.en # or pick another model"
+echo
+echo "  VTT example:"
+echo "    curl http://127.0.0.1:8080/inference -F file=@samples/jfk.wav -F response_format=vtt"

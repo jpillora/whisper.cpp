@@ -19,6 +19,8 @@
 #include <atomic>
 #include <functional>
 #include <cstdlib>
+#include <filesystem>
+#include <set>
 #if defined (_WIN32)
 #include <windows.h>
 #endif
@@ -113,7 +115,7 @@ struct whisper_params {
     std::string language               = "en";
     std::string prompt                 = "";
     std::string font_path              = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf";
-    std::string model                  = "models/ggml-base.en.bin";
+    std::string model                  = "small.en";
     std::string response_format        = json_format;
     std::string tdrz_speaker_turn      = " [SPEAKER_TURN]"; // TODO: set from command line
     std::string openvino_encode_device = "CPU";
@@ -129,6 +131,148 @@ struct whisper_params {
     int         vad_speech_pad_ms           = 30;
     float       vad_samples_overlap         = 0.1f;
 };
+
+// ---------------------------------------------------------------------------
+// On-demand model management
+//
+// Models are downloaded on first use and cached under a persistent state
+// directory, so the server is self-contained: no external download script and
+// no pre-staged model files are required. Subsequent starts reuse the cache.
+// ---------------------------------------------------------------------------
+
+// Known ggml model names (mirrors models/download-ggml-model.sh).
+const std::set<std::string> k_known_models = {
+    "tiny", "tiny.en", "tiny-q5_1", "tiny.en-q5_1", "tiny-q8_0",
+    "base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0",
+    "small", "small.en", "small.en-tdrz", "small-q5_1", "small.en-q5_1", "small-q8_0",
+    "medium", "medium.en", "medium-q5_0", "medium.en-q5_0", "medium-q8_0",
+    "large-v1", "large-v2", "large-v2-q5_0", "large-v2-q8_0",
+    "large-v3", "large-v3-q5_0", "large-v3-turbo", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0",
+};
+
+// Base directory for all server state, honoring the XDG Base Directory spec:
+//   $WHISPER_SERVER_STATE                 (explicit override), else
+//   $XDG_STATE_HOME/whisper-server,       else
+//   $HOME/.local/state/whisper-server
+std::string state_dir() {
+    if (const char * s = std::getenv("WHISPER_SERVER_STATE"); s && *s) {
+        return s;
+    }
+    if (const char * xdg = std::getenv("XDG_STATE_HOME"); xdg && *xdg) {
+        return std::string(xdg) + "/whisper-server";
+    }
+    if (const char * home = std::getenv("HOME"); home && *home) {
+        return std::string(home) + "/.local/state/whisper-server";
+    }
+    return "./.whisper-server";
+}
+
+std::string models_dir() {
+    return state_dir() + "/models";
+}
+
+std::string model_url(const std::string & name) {
+    // tinydiarize models live in a separate HF repo
+    if (name.find("tdrz") != std::string::npos) {
+        return "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml-" + name + ".bin";
+    }
+    return "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-" + name + ".bin";
+}
+
+// single-quote a string for safe use inside a /bin/sh command
+std::string shell_quote(const std::string & s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+}
+
+// Download url -> dest using curl (always present on macOS). Writes to a
+// temporary ".part" file first and renames on success, so an interrupted
+// download is never mistaken for a complete model on a later run.
+bool download_file(const std::string & url, const std::string & dest) {
+    const std::string tmp = dest + ".part";
+    const char * hf_token = std::getenv("HF_TOKEN");
+
+    std::ostringstream cmd;
+    cmd << "curl -L --fail --progress-bar"
+        << " --retry 5 --retry-delay 2 --retry-all-errors --retry-connrefused";
+    if (hf_token && *hf_token) {
+        cmd << " --header " << shell_quote(std::string("Authorization: Bearer ") + hf_token);
+    }
+    cmd << " --output " << shell_quote(tmp) << " " << shell_quote(url);
+
+    fprintf(stderr, "whisper-server: downloading %s\n", url.c_str());
+    const int status = std::system(cmd.str().c_str());
+    if (status != 0) {
+        std::remove(tmp.c_str());
+        fprintf(stderr, "whisper-server: download failed (exit %d)\n", status);
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, dest, ec);
+    if (ec) {
+        std::remove(tmp.c_str());
+        fprintf(stderr, "whisper-server: failed to finalize %s: %s\n", dest.c_str(), ec.message().c_str());
+        return false;
+    }
+    return true;
+}
+
+// Resolve a -m/--model value to a model file on disk, downloading on demand.
+// Accepts either a filesystem path (used as-is) or a model name such as
+// "small.en", which is cached at <state>/models/ggml-<name>.bin.
+// Returns an empty string on failure.
+std::string resolve_model(const std::string & model) {
+    // already a usable file on disk (explicit path or a pre-existing cache hit)
+    if (is_file_exist(model.c_str())) {
+        return model;
+    }
+
+    // looks like a path rather than a model name, but does not exist
+    const bool looks_like_path =
+        model.find('/') != std::string::npos ||
+        (model.size() >= 4 && model.compare(model.size() - 4, 4, ".bin") == 0);
+    if (looks_like_path) {
+        fprintf(stderr, "error: model file not found: %s\n", model.c_str());
+        return "";
+    }
+
+    // treat as a model name
+    if (k_known_models.find(model) == k_known_models.end()) {
+        fprintf(stderr, "error: unknown model '%s'\n", model.c_str());
+        fprintf(stderr, "       pass a path, or a known name, e.g.: tiny.en base.en small.en medium.en large-v3-turbo\n");
+        return "";
+    }
+
+    const std::string dir  = models_dir();
+    const std::string dest = dir + "/ggml-" + model + ".bin";
+
+    if (is_file_exist(dest.c_str())) {
+        return dest;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        fprintf(stderr, "error: failed to create %s: %s\n", dir.c_str(), ec.message().c_str());
+        return "";
+    }
+
+    fprintf(stderr, "whisper-server: model '%s' not cached, downloading to %s\n", model.c_str(), dest.c_str());
+    if (!download_file(model_url(model), dest)) {
+        return "";
+    }
+    fprintf(stderr, "whisper-server: model ready: %s\n", dest.c_str());
+    return dest;
+}
 
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params, const server_params& sparams) {
     fprintf(stderr, "\n");
@@ -164,7 +308,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -dl,       --detect-language           [%-7s] exit after automatically detecting language\n",    params.detect_language ? "true" : "false");
     fprintf(stderr, "             --prompt PROMPT             [%-7s] initial prompt\n",                                 params.prompt.c_str());
     fprintf(stderr, "             --carry-initial-prompt      [%-7s] always prepend initial prompt\n",                  params.carry_initial_prompt ? "true" : "false");
-    fprintf(stderr, "  -m FNAME,  --model FNAME               [%-7s] model path\n",                                     params.model.c_str());
+    fprintf(stderr, "  -m NAME,   --model NAME                [%-7s] model name (e.g. small.en) or path; downloaded on demand to the state dir\n", params.model.c_str());
     fprintf(stderr, "  -oved D,   --ov-e-device DNAME         [%-7s] the OpenVINO device used for encode inference\n",  params.openvino_encode_device.c_str());
     // server params
     fprintf(stderr, "  -dtw MODEL --dtw MODEL                 [%-7s] compute token-level timestamps\n",                          params.dtw.c_str());
@@ -657,6 +801,13 @@ int main(int argc, char ** argv) {
     if (sparams.ffmpeg_converter) {
         check_ffmpeg_availibility();
     }
+
+    // resolve the model (download on demand, cache under the state dir)
+    params.model = resolve_model(params.model);
+    if (params.model.empty()) {
+        return 3;
+    }
+
     // whisper init
     struct whisper_context_params cparams = whisper_context_default_params();
 
@@ -774,7 +925,7 @@ int main(int argc, char ** argv) {
         <pre>
     curl 127.0.0.1:)" + std::to_string(sparams.port) + R"(/load \
     -H "Content-Type: multipart/form-data" \
-    -F model="&lt;path-to-model-file&gt;"
+    -F model="&lt;model-name-or-path&gt;"
         </pre>
 
         <div>
@@ -1171,11 +1322,10 @@ int main(int argc, char ** argv) {
             res.set_content(error_resp, "application/json");
             return;
         }
-        std::string model = req.get_file_value("model").content;
-        if (!is_file_exist(model.c_str()))
+        std::string model = resolve_model(req.get_file_value("model").content);
+        if (model.empty())
         {
-            fprintf(stderr, "error: 'model': %s not found!\n", model.c_str());
-            const std::string error_resp = "{\"error\":\"model not found!\"}";
+            const std::string error_resp = "{\"error\":\"model not found and could not be downloaded\"}";
             res.status = 400;
             res.set_content(error_resp, "application/json");
             return;
