@@ -771,6 +771,18 @@ void get_req_parameters(const Request & req, whisper_params & params)
     }
 }
 
+// OpenAI sends timestamp_granularities[] as one or more multipart fields; return
+// true if "word" granularity was requested (-> emit a top-level words[] array).
+bool wants_word_timestamps(const Request & req) {
+    for (const auto & f : req.files) {
+        if (f.first.rfind("timestamp_granularities", 0) == 0 &&
+            f.second.content.find("word") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -965,7 +977,10 @@ int main(int argc, char ** argv) {
     svr->Options(sparams.request_path + sparams.inference_path, [&](const Request &, Response &){
     });
 
-    svr->Post(sparams.request_path + sparams.inference_path, [&](const Request &req, Response &res){
+    // Shared handler for the native /inference path and the OpenAI-compatible
+    // /v1/audio/{transcriptions,translations} routes. force_translate=true makes
+    // the translations route always translate to English.
+    auto handle_inference = [&](const Request &req, Response &res, bool force_translate){
         // acquire whisper model mutex lock
         std::lock_guard<std::mutex> lock(whisper_mutex);
 
@@ -982,6 +997,10 @@ int main(int argc, char ** argv) {
 
         whisper_params params = default_params;
         get_req_parameters(req, params);
+        if (force_translate) {
+            params.translate = true;
+        }
+        const bool want_words = wants_word_timestamps(req);
 
         std::string filename{audio_file.filename};
         printf("Received request: %s\n", filename.c_str());
@@ -990,42 +1009,34 @@ int main(int argc, char ** argv) {
         std::vector<float> pcmf32;               // mono-channel F32 PCM
         std::vector<std::vector<float>> pcmf32s; // stereo-channel F32 PCM
 
-        if (sparams.ffmpeg_converter) {
-            // if file is not wav, convert to wav
-            // write to temporary file
-            const std::string temp_filename = generate_temp_filename(sparams.tmp_dir, "whisper-server", ".wav");
+        // Decode the audio. Try the native decoder first (wav/mp3/flac); if it
+        // can't read the input (e.g. m4a/mp4/webm) — or --convert was requested —
+        // fall back to ffmpeg, transcoding to wav and retrying. Only a genuinely
+        // undecodable file is rejected.
+        bool decoded = false;
+        if (!sparams.ffmpeg_converter) {
+            decoded = ::read_audio_data(audio_file.content.data(), audio_file.content.size(), pcmf32, pcmf32s, params.diarize);
+        }
+        if (!decoded) {
+            // write the upload to a temp file and convert with ffmpeg
+            const std::string temp_filename = generate_temp_filename(sparams.tmp_dir, "whisper-server", ".bin");
             std::ofstream temp_file{temp_filename, std::ios::binary};
             temp_file << audio_file.content;
             temp_file.close();
 
-            std::string error_resp = "{\"error\":\"Failed to execute ffmpeg command.\"}";
-            const bool is_converted = convert_to_wav(temp_filename, error_resp, params.diarize);
-            if (!is_converted) {
-                res.status = 500;
-                res.set_content(error_resp, "application/json");
-                return;
+            pcmf32.clear();
+            pcmf32s.clear();
+            std::string conv_err;
+            if (convert_to_wav(temp_filename, conv_err, params.diarize)) {
+                decoded = ::read_audio_data(temp_filename, pcmf32, pcmf32s, params.diarize);
             }
-
-            // read audio content into pcmf32
-            if (!::read_audio_data(temp_filename, pcmf32, pcmf32s, params.diarize))
-            {
-                fprintf(stderr, "error: failed to read WAV file '%s'\n", temp_filename.c_str());
-                const std::string error_resp = "{\"error\":\"failed to read WAV file\"}";
-                res.status = 400;
-                res.set_content(error_resp, "application/json");
-                std::remove(temp_filename.c_str());
-                return;
-            }
-            // remove temp file
             std::remove(temp_filename.c_str());
-        } else {
-            if (!::read_audio_data(audio_file.content.data(), audio_file.content.size(), pcmf32, pcmf32s, params.diarize)) {
-                fprintf(stderr, "error: failed to read audio data\n");
-                const std::string error_resp = "{\"error\":\"failed to read audio data\"}";
-                res.status = 400;
-                res.set_content(error_resp, "application/json");
-                return;
-            }
+        }
+        if (!decoded) {
+            fprintf(stderr, "error: failed to decode audio '%s'\n", filename.c_str());
+            res.status = 400;
+            res.set_content("{\"error\":\"failed to decode audio; unsupported or corrupt file (mp4/m4a/webm require ffmpeg on the server)\"}", "application/json");
+            return;
         }
 
         printf("Successfully loaded %s\n", filename.c_str());
@@ -1228,6 +1239,7 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+            json oai_words = json::array(); // top-level words[] for OpenAI word granularity
             const int n_segments = whisper_full_n_segments(ctx);
             for (int i = 0; i < n_segments; ++i)
             {
@@ -1286,6 +1298,14 @@ int main(int argc, char ** argv) {
                     word["probability"] = token.p;
                     total_logprob += token.plog;
                     segment["words"].push_back(word);
+
+                    if (want_words && !params.no_timestamps && params.token_timestamps) {
+                        oai_words.push_back(json{
+                            {"word",  word_text},
+                            {"start", token.t0 * 0.01},
+                            {"end",   word_t1 * 0.01},
+                        });
+                    }
                 }
 
                 segment["temperature"] = params.temperature;
@@ -1296,6 +1316,9 @@ int main(int argc, char ** argv) {
                 segment["no_speech_prob"] = whisper_full_get_segment_no_speech_prob(ctx, i);
 
                 jres["segments"].push_back(segment);
+            }
+            if (want_words) {
+                jres["words"] = oai_words;
             }
             res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
                             "application/json");
@@ -1310,7 +1333,17 @@ int main(int argc, char ** argv) {
             res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
                             "application/json");
         }
-    });
+    };
+
+    // native endpoint + OpenAI-compatible STT endpoints (point an OpenAI client's
+    // base_url at http://<host>:<port>/v1). The `model` field is accepted and
+    // ignored; the served model is chosen at startup with -m/--model.
+    svr->Post(sparams.request_path + sparams.inference_path,     [&](const Request &req, Response &res){ handle_inference(req, res, false); });
+    svr->Post(sparams.request_path + "/v1/audio/transcriptions", [&](const Request &req, Response &res){ handle_inference(req, res, false); });
+    svr->Post(sparams.request_path + "/v1/audio/translations",   [&](const Request &req, Response &res){ handle_inference(req, res, true);  });
+    svr->Options(sparams.request_path + "/v1/audio/transcriptions", [&](const Request &, Response &){});
+    svr->Options(sparams.request_path + "/v1/audio/translations",   [&](const Request &, Response &){});
+
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
         state.store(SERVER_STATE_LOADING_MODEL);
@@ -1379,6 +1412,10 @@ int main(int argc, char ** argv) {
     });
 
     svr->set_error_handler([](const Request &req, Response &res) {
+        // don't clobber a JSON error body a handler already set
+        if (!res.body.empty()) {
+            return;
+        }
         if (res.status == 400) {
             res.set_content("Invalid request", "text/plain");
         } else if (res.status != 500) {
